@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
+import argparse
 import socket
 import socketserver
+import ssl
 import struct
-import sys
 import datetime
+import sys
 
 HOST = "0.0.0.0"
 PORT = 5566
 
 
 class PluginHandler:
-    def __init__(self):
+    def __init__(self, plugins):
         self.plugin_list = []
 
-        for modname in sys.argv[1:]:
+        for modname in plugins:
             self.plugin_list.append((modname, __import__("plugins.mod_%s" % modname, fromlist=["plugins"])))
             print("Loaded", "mod_%s" % modname)
 
@@ -86,14 +88,28 @@ class NFCGateClientHandler(socketserver.StreamRequestHandler):
 
 
 class NFCGateServer(socketserver.ThreadingTCPServer):
-    def __init__(self, server_address, request_handler, bind_and_activate=True):
+    def __init__(self, server_address, request_handler, plugins, tls_options=None, bind_and_activate=True):
         self.allow_reuse_address = True
         super().__init__(server_address, request_handler, bind_and_activate)
 
         self.clients = {}
-        self.plugins = PluginHandler()
+        self.plugins = PluginHandler(plugins)
+
+        # TLS
+        self.tls_options = tls_options
+
         self.log("NFCGate server listening on", server_address)
-        
+        if self.tls_options:
+            self.log("TLS enabled with cert {} and key {}".format(self.tls_options["cert_file"],
+                                                                  self.tls_options["key_file"]))
+
+    def get_request(self):
+        client_socket, from_addr = super().get_request()
+        if not self.tls_options:
+            return client_socket, from_addr
+        # if TLS enabled, wrap the socket
+        return self.tls_options["context"].wrap_socket(client_socket, server_side=True), from_addr
+
     def log(self, *args, origin="0", tag="server"):
         print(datetime.datetime.now(), "["+tag+"]", origin, *args)
 
@@ -133,5 +149,40 @@ class NFCGateServer(socketserver.ThreadingTCPServer):
         self.log("Publish reached", len(self.clients[session]) - 1, "clients")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(prog="NFCGate server")
+    parser.add_argument("plugins", type=str, nargs="*", help="List of plugin modules to load.")
+    parser.add_argument("-s", "--tls", help="Enable TLS. You must specify certificate and key.",
+                        default=False, action="store_true")
+    parser.add_argument("--tls_cert", help="TLS certificate file in PEM format.", action="store")
+    parser.add_argument("--tls_key", help="TLS key file in PEM format.", action="store")
+
+    args = parser.parse_args()
+    tls_options = None
+
+    if args.tls:
+        # check cert and key file
+        if args.tls_cert is None or args.tls_key is None:
+            print("You must specify tls_cert and tls_key!")
+            sys.exit(1)
+
+        tls_options = {
+            "cert_file": args.tls_cert,
+            "key_file": args.tls_key
+        }
+        try:
+            tls_options["context"] = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+            tls_options["context"].load_cert_chain(tls_options["cert_file"], tls_options["key_file"])
+        except ssl.SSLError:
+            print("Certificate or key could not be loaded. Please check format and file permissions!")
+            sys.exit(1)
+    return args.plugins, tls_options
+
+
+def main():
+    plugins, tls_options = parse_args()
+    NFCGateServer((HOST, PORT), NFCGateClientHandler, plugins, tls_options).serve_forever()
+
+
 if __name__ == "__main__":
-    NFCGateServer((HOST, PORT), NFCGateClientHandler).serve_forever()
+    main()
