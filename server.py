@@ -410,7 +410,7 @@ class NFCGateServer:
                     body = json.dumps(list(log_hub.buffer)).encode("utf-8")
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n" + body)
                 else:
-                    body = LOG_PAGE.encode("utf-8")
+                    body = _load_page().encode("utf-8")   # re-read so weblog.html edits show on refresh
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n" + body)
                 await writer.drain()
             except Exception as e:
