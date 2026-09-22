@@ -131,6 +131,14 @@ def _load_page():
 LOG_PAGE = _load_page()
 
 
+def _list_captures():
+    try:
+        d = "captures"
+        return sorted(f for f in os.listdir(d) if f.endswith(".jsonl")) if os.path.isdir(d) else []
+    except Exception:
+        return []
+
+
 # Configure structured logging
 def setup_logging(level="INFO"):
     logger = logging.getLogger()
@@ -154,24 +162,59 @@ def log(message, origin="server", tag="server", level="INFO"):
     log_function(json.dumps(log_message))
 
 
+# Plugins known to the web portal (loaded at start; toggle/config at runtime).
+KNOWN_PLUGINS = ["modify", "log"]
+
 class PluginHandler:
     def __init__(self, plugins):
-        self.plugin_list = []
-        for modname in plugins:
+        self.plugins = {}     # name -> module (ordered: filter runs in this order)
+        self.enabled = {}     # name -> bool
+        for modname in list(dict.fromkeys(list(KNOWN_PLUGINS) + list(plugins))):
             try:
-                plugin_module = __import__(f"plugins.mod_{modname}", fromlist=["plugins"])
-                self.plugin_list.append((modname, plugin_module))
-                logging.info(f"Loaded mod_{modname}")
+                mod = __import__(f"plugins.mod_{modname}", fromlist=["plugins"])
+                self.plugins[modname] = mod
+                self.enabled[modname] = modname in plugins   # on only if requested on CLI
+                logging.info(f"Loaded mod_{modname} (enabled={self.enabled[modname]})")
             except ImportError as e:
                 logging.error(f"Failed to load mod_{modname}: {e}")
 
     async def filter(self, client, data):
-        for modname, plugin in self.plugin_list:
+        for name, mod in self.plugins.items():
+            if not self.enabled.get(name):
+                continue
             try:
-                data = await plugin.handle_data(lambda *x, level="INFO": client.log(*x, tag=modname, level=level), data, client.state)
+                data = await mod.handle_data(lambda *x, level="INFO": client.log(*x, tag=name, level=level), data, client.state)
             except Exception as e:
-                client.log(f"Error in plugin {modname}: {e}", tag="plugin", level="ERROR")
+                client.log(f"Error in plugin {name}: {e}", tag="plugin", level="ERROR")
         return data
+
+    def list(self):
+        out = []
+        for name, mod in self.plugins.items():
+            info = {"name": name, "enabled": bool(self.enabled.get(name))}
+            if hasattr(mod, "describe"):
+                try:
+                    info.update(mod.describe() or {})
+                except Exception:
+                    pass
+            out.append(info)
+        return out
+
+    def toggle(self, name, on):
+        if name in self.plugins:
+            self.enabled[name] = bool(on)
+            return True
+        return False
+
+    def configure(self, name, data):
+        mod = self.plugins.get(name)
+        if mod is not None and hasattr(mod, "configure"):
+            try:
+                mod.configure(data or {})
+                return True
+            except Exception as e:
+                logging.warning(f"configure({name}) failed: {e}")
+        return False
 
 
 class Client:
@@ -393,22 +436,77 @@ class NFCGateServer:
         async with health_server:
             await health_server.serve_forever()
 
+    def _control(self, path, payload):
+        parts = path.strip("/").split("/")   # e.g. api/plugins/modify/toggle
+        if len(parts) == 4 and parts[1] == "plugins":
+            name, action = parts[2], parts[3]
+            if action == "toggle":
+                ok = self.plugins.toggle(name, payload.get("enabled", True))
+                log(f"plugin {name} enabled={payload.get('enabled', True)} via portal", tag="control")
+                return {"ok": ok, "plugins": self.plugins.list()}
+            if action == "config":
+                ok = self.plugins.configure(name, payload)
+                log(f"plugin {name} reconfigured via portal", tag="control")
+                return {"ok": ok, "plugins": self.plugins.list()}
+        if len(parts) == 3 and parts[1] == "control":
+            if parts[2] == "delay":
+                try:
+                    self.delay_ms = max(0, int(payload.get("ms", 0)))
+                except (TypeError, ValueError):
+                    pass
+                log(f"artificial delay set to {self.delay_ms} ms via portal", tag="control")
+                return {"ok": True, "delay_ms": self.delay_ms}
+            if parts[2] == "replay":
+                fp = os.path.join("captures", os.path.basename(payload.get("file", "")))
+                if payload.get("file") and os.path.exists(fp):
+                    asyncio.create_task(self.replay_frames(fp, bool(payload.get("loop"))))
+                    return {"ok": True, "replaying": fp}
+                return {"ok": False, "error": "capture not found"}
+        return {"ok": False, "error": "unknown endpoint"}
+
     async def log_http_server(self):
         async def handle(reader, writer):
             try:
                 request_line = await reader.readline()
+                clen = 0
                 while True:
                     hdr = await reader.readline()
                     if hdr in (b"\r\n", b"\n", b""):
                         break
+                    if hdr.lower().startswith(b"content-length:"):
+                        try:
+                            clen = int(hdr.split(b":", 1)[1].strip())
+                        except ValueError:
+                            clen = 0
                 parts = request_line.split()
+                method = parts[0].decode("latin-1") if parts else "GET"
                 path = parts[1].decode("latin-1") if len(parts) >= 2 else "/"
+                body_raw = await reader.readexactly(clen) if clen > 0 else b""
+                peer = writer.get_extra_info("peername")
+                loopback = bool(peer) and str(peer[0]) in ("127.0.0.1", "::1")
+
+                def send_json(obj, code="200 OK"):
+                    b = json.dumps(obj).encode("utf-8")
+                    writer.write(("HTTP/1.1 %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n" % code).encode() + b)
+
                 if path.startswith("/stream"):
                     await self._log_stream(writer)
                     return
-                if path.startswith("/logs"):
-                    body = json.dumps(list(log_hub.buffer)).encode("utf-8")
-                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n" + body)
+                if path == "/logs":
+                    send_json(list(log_hub.buffer))
+                elif path == "/api/plugins" and method == "GET":
+                    send_json({"plugins": self.plugins.list()})
+                elif path == "/api/control" and method == "GET":
+                    send_json({"delay_ms": self.delay_ms, "captures": _list_captures()})
+                elif path.startswith("/api/") and method == "POST":
+                    if not loopback:
+                        send_json({"error": "control allowed only from localhost"}, "403 Forbidden")
+                    else:
+                        try:
+                            payload = json.loads(body_raw or b"{}")
+                        except Exception:
+                            payload = {}
+                        send_json(self._control(path, payload))
                 else:
                     body = _load_page().encode("utf-8")   # re-read so weblog.html edits show on refresh
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n" + body)

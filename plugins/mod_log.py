@@ -120,3 +120,7 @@ def log(message, level="INFO"):
         logger.warning(message)
     else:
         logger.info(message)
+
+
+def describe():
+    return {"title": "Console APDU log (coloured)", "fields": []}
