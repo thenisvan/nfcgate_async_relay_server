@@ -11,5 +11,8 @@ services:
     # plugin na logovanie APDU:            command: ["log"]
     # plugin na modifikáciu APDU (lab MITM): command: ["modify"]
     #   a k nemu pravidlo:  environment: [ "NFCGATE_PATCH_RULES=a0000000041010=a0000000031010" ]
+    # umelá relay latencia (demo timing obrany): environment: [ "NFCGATE_DELAY_MS=200" ]
+    # záznam rámcov:                              environment: [ "NFCGATE_RECORD=/data/capture.jsonl" ]  (+ volume)
+    # replay bez telefónov:                       command: ["--replay","/data/capture.jsonl","--replay-loop"]
     command: []
     restart: unless-stopped

@@ -46,5 +46,6 @@ Brainstorm pre demo prednášky Ghost Tap. Zoradené, s odporúčaným výberom 
 K tomu ako rýchle výhry: pytest suita + CI (ops #5) a Prometheus/Grafana profil (ops #3).
 
 **Doimplementované navyše (2026-09-22):** pytest suita + GitHub Actions CI (ops #5),
-a plugin `mod_modify` na živú modifikáciu relayovaného APDU (port konceptu
-penegui/`mod_pixpatch` do nášho protokolu, bezpečne vypnutý bez pravidiel).
+plugin `mod_modify` na živú modifikáciu relayovaného APDU, **latency hero + umelé
+oneskorenie `--delay-ms`** (viz #1/#3) a **capture/replay** (`--record` / `--replay`,
+viz #2/#9) — deterministický fallback dema bez telefónov.

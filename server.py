@@ -37,6 +37,7 @@ DEFAULT_PORT = _env_int("NFCGATE_PORT", 5566)
 DEFAULT_HEALTH_PORT = _env_int("NFCGATE_HEALTH_PORT", 8080)
 DEFAULT_METRICS_PORT = _env_int("NFCGATE_METRICS_PORT", 8000)
 DEFAULT_LOG_PORT = _env_int("NFCGATE_LOG_PORT", 8090)
+DEFAULT_DELAY_MS = _env_int("NFCGATE_DELAY_MS", 0)
 
 # Set uvloop as the event loop policy for better performance
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -202,18 +203,25 @@ class Client:
         except Exception as e:
             self.log(f"Error: {e}", level="ERROR")
         finally:
-            self.writer.close()
-            await self.writer.wait_closed()
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
 
 
 class NFCGateServer:
-    def __init__(self, host, port, plugins, tls_options=None, max_clients=100, health_port=DEFAULT_HEALTH_PORT, log_port=DEFAULT_LOG_PORT, max_peers=2, allow_nets=None):
+    def __init__(self, host, port, plugins, tls_options=None, max_clients=100, health_port=DEFAULT_HEALTH_PORT, log_port=DEFAULT_LOG_PORT, max_peers=2, allow_nets=None, delay_ms=0, record_path=None, replay_path=None, replay_loop=False):
         self.host = host
         self.port = port
         self.health_port = health_port
         self.log_port = log_port
         self.max_peers = max_peers            # max clients per session (0 = unlimited)
         self.allow_nets = allow_nets or []    # list of ip_network; empty = allow all
+        self.delay_ms = delay_ms              # artificial relay latency (ms), for demoing timing defenses
+        self.replay_path = replay_path
+        self.replay_loop = replay_loop
+        self._rec = open(record_path, "a", buffering=1) if record_path else None
         self.plugins = PluginHandler(plugins)
         self.clients = {}
         self._last_frame_ts = {}              # session -> monotonic ts of last frame
@@ -253,11 +261,46 @@ class NFCGateServer:
         now = time.monotonic()
         prev = self._last_frame_ts.get(session_id)
         self._last_frame_ts[session_id] = now
-        ev = {"t": "frame", "ts": _now(), "session": session_id, "n": len(payload)}
+        ev = {"t": "frame", "ts": _now(), "ms": int(time.time() * 1000), "session": session_id, "n": len(payload)}
         if prev is not None:
             ev["dt"] = round((now - prev) * 1000, 1)   # ms since previous frame in this session
+        if self.delay_ms:
+            ev["delay"] = self.delay_ms
         ev.update(decode_frame(payload))
         log_hub.publish(ev)
+        if self._rec:
+            try:
+                self._rec.write(json.dumps(ev) + "\n")
+            except Exception:
+                pass
+
+    async def replay_frames(self, path, loop=False):
+        try:
+            with open(path) as f:
+                events = [json.loads(l) for l in f if l.strip()]
+        except (OSError, ValueError) as e:
+            log(f"Replay: cannot read {path}: {e}", tag="replay", level="ERROR")
+            return
+        events = [e for e in events if e.get("t") == "frame"]
+        if not events:
+            log(f"Replay: no frames in {path}", tag="replay", level="WARNING")
+            return
+        log(f"Replay: {len(events)} frames from {path}" + (" (loop)" if loop else ""), tag="replay")
+        while True:
+            prev_ms = None
+            for ev in events:
+                ms = ev.get("ms")
+                if prev_ms is not None and ms is not None:
+                    await asyncio.sleep(min(max((ms - prev_ms) / 1000.0, 0), 2.0))
+                prev_ms = ms
+                out = dict(ev)
+                out["ts"] = _now()
+                out["replay"] = True
+                log_hub.publish(out)
+            if not loop:
+                break
+            await asyncio.sleep(1.5)
+        log("Replay: finished", tag="replay")
 
     async def process_data(self, client, session_id, data):
         # Filter data through plugins
@@ -296,6 +339,8 @@ class NFCGateServer:
     async def send_to_clients(self, session, data, origin):
         if session not in self.clients:
             return
+        if self.delay_ms:
+            await asyncio.sleep(self.delay_ms / 1000.0)   # simulate relay/WAN latency
         for client in list(self.clients[session]):
             if client is origin:
                 continue
@@ -303,7 +348,7 @@ class NFCGateServer:
                 async with client.write_lock:
                     client.writer.write(struct.pack("!I", len(data)) + data)
                     await client.writer.drain()
-            except (ConnectionResetError, asyncio.IncompleteReadError):
+            except (ConnectionResetError, asyncio.IncompleteReadError, BrokenPipeError, OSError):
                 self.remove_client(client)
         log(f"Publish reached {len(self.clients.get(session, []))} clients", tag="broadcast")
 
@@ -419,6 +464,10 @@ class NFCGateServer:
         if self.log_port:
             asyncio.create_task(self.log_http_server())
 
+        # Replay a recorded capture into the web log (no hardware needed)
+        if self.replay_path:
+            asyncio.create_task(self.replay_frames(self.replay_path, self.replay_loop))
+
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown(server)))
@@ -450,6 +499,10 @@ def parse_args():
     parser.add_argument("--log-port", type=int, default=DEFAULT_LOG_PORT, help=f"Web log service port (live APDU stream), 0 disables (default {DEFAULT_LOG_PORT}, env NFCGATE_LOG_PORT).")
     parser.add_argument("--max-peers", type=int, default=_env_int("NFCGATE_MAX_PEERS", 2), help="Max clients per session, 0 = unlimited (default 2 = reader+card, env NFCGATE_MAX_PEERS).")
     parser.add_argument("--allow", default=os.environ.get("NFCGATE_ALLOW", ""), help="Comma-separated IP/CIDR allowlist for incoming connections (default: allow all, env NFCGATE_ALLOW).")
+    parser.add_argument("--delay-ms", type=int, default=DEFAULT_DELAY_MS, help="Artificial relay latency in ms added to every relayed frame, to demo timing-based defenses (default 0, env NFCGATE_DELAY_MS).")
+    parser.add_argument("--record", default=os.environ.get("NFCGATE_RECORD", ""), help="Append decoded frames to this JSONL file for later replay.")
+    parser.add_argument("--replay", default="", help="Replay a JSONL capture into the web log on startup (no hardware needed).")
+    parser.add_argument("--replay-loop", action="store_true", help="Loop the --replay capture continuously.")
     parser.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging, includes raw relayed frames on the console.")
     parser.add_argument("-s", "--tls", help="Enable TLS. You must specify certificate and key.", default=False, action="store_true")
     parser.add_argument("--tls_cert", help="TLS certificate file in PEM format.", action="store")
@@ -487,10 +540,18 @@ def main():
             logging.warning(f"Ignoring invalid --allow entry: {item!r}")
     server = NFCGateServer(args.host, args.port, args.plugins, tls_options,
                            health_port=args.health_port, log_port=args.log_port,
-                           max_peers=args.max_peers, allow_nets=allow_nets)
+                           max_peers=args.max_peers, allow_nets=allow_nets,
+                           delay_ms=args.delay_ms, record_path=(args.record or None),
+                           replay_path=(args.replay or None), replay_loop=args.replay_loop)
     if allow_nets:
         logging.info(f"Connection allowlist: {[str(n) for n in allow_nets]}")
     logging.info(f"Max peers per session: {args.max_peers or 'unlimited'}")
+    if args.delay_ms:
+        logging.info(f"Artificial relay latency: {args.delay_ms} ms")
+    if args.record:
+        logging.info(f"Recording frames to: {args.record}")
+    if args.replay:
+        logging.info(f"Replaying capture: {args.replay}" + (" (loop)" if args.replay_loop else ""))
 
     # Start the Prometheus metrics server (metrics_port=0 disables it)
     if args.metrics_port:
