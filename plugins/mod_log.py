@@ -81,12 +81,14 @@ async def handle_data(log, data, state):
         log_message = json.dumps(log_entry)
         log(log_message)  # Default log level is INFO
 
-        # Asynchronously log to an external service if needed (e.g., monitoring system)
-        await log_to_external_service(log_entry)
+        # NOTE: external-service logging is intentionally NOT awaited in the relay
+        # hot path — awaiting adds latency to every relayed APDU. If you need it,
+        # fire-and-forget: asyncio.create_task(log_to_external_service(log_entry))
 
     except Exception as e:
         log(f"Error handling data: {e}", level="ERROR")
-        return {"error": str(e)}
+        # fix 2: pass the ORIGINAL bytes through so a bad frame never corrupts the relay
+        return data
 
     return data
 
@@ -97,9 +99,8 @@ async def log_to_external_service(log_entry):
     Replace this with actual logic for integrating with an API, database, or other service.
     """
     try:
-        # Simulate async logging operation (e.g., an API call)
-        await asyncio.sleep(0.1)  # Simulated delay for async logging
-        logger.info(f"Logged to external service: {log_entry}")
+        # Real integration would perform async I/O here (API/DB). No artificial delay.
+        logger.debug(f"Logged to external service: {log_entry}")
 
     except Exception as e:
         logger.error(f"Failed to log to external service: {e}")
@@ -119,3 +120,7 @@ def log(message, level="INFO"):
         logger.warning(message)
     else:
         logger.info(message)
+
+
+def describe():
+    return {"title": "Console APDU log (coloured)", "fields": []}
