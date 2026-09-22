@@ -24,6 +24,18 @@ input[type=number]{width:60px}
 .pill{display:none;background:var(--yellow);color:#0b0b0b;font-weight:700;font-size:11px;border-radius:4px;padding:1px 7px}
 .pill.on{display:inline-block}
 .spark{background:#181c1f;border-radius:4px;vertical-align:middle}
+/* presenter mode: big fonts, minimal chrome (projector) */
+body.presenter header label,body.presenter #pause,body.presenter #clear,body.presenter #portalbtn,body.presenter #refbtn{display:none}
+body.presenter .ctxbar{font-size:16px}
+body.presenter #log{font-size:16px}
+body.presenter .cell .lbl{font-size:21px}
+body.presenter .cell .hx{font-size:16px}
+body.presenter .frame .m{font-size:15px}
+body.presenter .arrow{font-size:16px} body.presenter .dt{font-size:14px}
+body.presenter .flowhead{padding:12px 14px} body.presenter .flowhead .nm{font-size:22px} body.presenter .flowhead .sub{font-size:15px}
+body.presenter .tagrow{font-size:16px}
+body.presenter .hero{font-size:26px} body.presenter .hero b{font-size:34px}
+body.presenter .spark{width:180px;height:36px}
 /* context strip */
 .ctxbar{display:flex;gap:18px;flex-wrap:wrap;align-items:center;padding:8px 20px;background:var(--panel2);border-bottom:1px solid #2b2f33;font-size:13px}
 .ctxbar .k{color:var(--muted)} .ctxbar .v{font-weight:700}
@@ -106,6 +118,7 @@ input[type=number]{width:60px}
   <label class="meta"><input type="checkbox" id="auto" checked> auto-scroll</label>
   <button class="btn" id="pause">Pause</button>
   <button class="btn" id="clear">Clear</button>
+  <button class="btn" id="presbtn">Presenter</button>
   <button class="btn" id="portalbtn">Portal</button>
   <button class="btn" id="refbtn">Reference</button>
 </header>
@@ -387,6 +400,9 @@ async function api(path,method,body){const o={method:method||'GET'};if(body!==un
 function tamperBanner(pl){const m=(pl||[]).find(p=>p.name==='modify');document.getElementById('tamper').classList.toggle('on',!!(m&&m.enabled&&m.active));}
 $('portalbtn').onclick=()=>{portalEl.classList.toggle('on');if(portalEl.classList.contains('on'))loadPortal();};
 $('portalclose').onclick=()=>portalEl.classList.remove('on');
+$('presbtn').onclick=()=>{const on=document.body.classList.toggle('presenter');$('presbtn').classList.toggle('active',on);
+  try{if(on&&!document.fullscreenElement&&document.documentElement.requestFullscreen)document.documentElement.requestFullscreen();else if(!on&&document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen();}catch(e){}};
+document.addEventListener('keydown',e=>{if(e.key==='f'&&!/^(input|textarea|select)$/i.test(e.target.tagName))$('presbtn').click();});
 async function loadPortal(){
   let pj,cj; try{pj=await api('/api/plugins');cj=await api('/api/control');}catch(e){$('portalbody').innerHTML='<p class="meta">API nedostupné (otvor cez http://127.0.0.1:'+location.port+'/ kvôli control POST).</p>';return;}
   let h='<h3>Relay</h3><label class="prow">Umelá latencia: <span id="pl-delayv">'+(cj.delay_ms||0)+' ms</span><input id="pl-delay" type="range" min="0" max="500" step="10" value="'+(cj.delay_ms||0)+'" style="width:100%"></label>';
