@@ -1,0 +1,13 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.idea/
+protocol/
+tests/
+conftest.py
+pytest.ini
+requirements-dev.txt
+.github/
+IDEAS.md
+*.md

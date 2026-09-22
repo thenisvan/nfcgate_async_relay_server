@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="sk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFCGate relay - live log</title>
+<style>
+:root{--bg:#141414;--panel:#202427;--line:#22262a;--green:#1DA578;--greenl:#c9f5e4;--purple:#a290ee;--purplel:#e2dcff;--muted:#9199a1;--red:#fe3030;--yellow:#ffd233}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:#e9ecef;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:12px 20px;border-bottom:1px solid #2b2f33;position:sticky;top:0;background:var(--bg);z-index:3}
+header h1{font-size:16px;margin:0;font-weight:700}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--muted);flex:none}
+.dot.on{background:var(--green)}
+.spacer{flex:1}
+.meta{color:var(--muted);font-size:13px}
+.stat b{color:#e9ecef;font-variant-numeric:tabular-nums}
+select,.btn,input[type=number]{background:var(--panel);color:#e9ecef;border:1px solid #333;border-radius:6px;padding:6px 10px;font-size:13px}
+.btn{cursor:pointer}
+.btn.active{border-color:var(--green);color:var(--green)}
+input[type=number]{width:64px}
+.lanes{display:grid;grid-template-columns:130px 1fr 96px 1fr;gap:8px;padding:8px 20px;position:sticky;top:53px;background:var(--bg);border-bottom:1px solid #2b2f33;z-index:2}
+.laneh{font-weight:700;font-size:12px;letter-spacing:.3px}
+.laneh.L{grid-column:2;color:var(--green)}
+.laneh.R{grid-column:4;color:var(--purple);text-align:right}
+#log{padding:6px 20px 60px}
+.frame{display:grid;grid-template-columns:130px 1fr 96px 1fr;gap:8px;align-items:start;padding:3px 0;border-bottom:1px solid var(--line)}
+.frame .m{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center}
+.sess{border-radius:4px;padding:0 6px;font-size:11px;font-weight:700;color:#0b0b0b}
+.arrow{text-align:center;font-weight:700;font-size:12px;padding-top:2px}
+.frame.R .arrow{color:var(--green)} .frame.C .arrow{color:var(--purple)}
+.dt{display:block;font-weight:400;color:var(--muted);font-size:11px}
+.dt.warn{color:var(--yellow)} .dt.bad{color:var(--red)}
+.cell{border:1px solid var(--line);border-radius:8px;padding:6px 9px;cursor:pointer}
+.frame.R .cell{border-left:3px solid var(--green)}
+.frame.C .cell{border-right:3px solid var(--purple)}
+.cell .lbl{font-weight:700}
+.frame.R .cell .lbl{color:var(--green)} .frame.C .cell .lbl{color:var(--purple)}
+.cell .hx{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#8ea0ad;word-break:break-all;margin-top:2px}
+.det{margin-top:6px;border-top:1px dashed #333;padding-top:6px;display:none}
+.cell.open .det{display:block}
+.tlv{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.6}
+.tlv .tag{color:var(--purple)} .tlv .nm{color:#e9ecef} .tlv .v{color:var(--greenl)} .tlv .mask{color:var(--yellow)}
+.sys{grid-column:1 / -1;color:var(--muted);font-size:12px;padding:3px 0;border-bottom:1px solid var(--line);font-family:ui-monospace,Menlo,Consolas,monospace}
+.sys.ERROR{color:var(--red)} .sys.WARNING{color:var(--yellow)}
+</style></head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>NFCGate relay <span class="meta">- live APDU ladder</span></h1>
+  <span class="spacer"></span>
+  <span class="meta stat">frames <b id="cF">0</b> · <span style="color:var(--green)">R <b id="cR">0</b></span> · <span style="color:var(--purple)">C <b id="cC">0</b></span> · max Δ <b id="cD">0</b> ms</span>
+  <label class="meta">session <select id="sess"><option value="all">všetky</option></select></label>
+  <label class="meta">Δ prah <input type="number" id="thr" value="50" min="0"> ms</label>
+  <label class="meta" title="Odmaskovať PAN a Track2 (len pri testovacích kartách!)"><input type="checkbox" id="reveal"> reveal PAN</label>
+  <label class="meta"><input type="checkbox" id="auto" checked> auto-scroll</label>
+  <button class="btn" id="pause">Pause</button>
+  <button class="btn" id="clear">Clear</button>
+</header>
+<div class="lanes"><div class="laneh L">READER · telefón pri karte</div><div class="laneh R">CARD · telefón pri POS</div></div>
+<div id="log"></div>
+<script>
+const $=id=>document.getElementById(id);
+const logEl=$('log'),dot=$('dot'),auto=$('auto'),sessSel=$('sess'),thr=$('thr'),reveal=$('reveal');
+const cF=$('cF'),cR=$('cR'),cC=$('cC'),cD=$('cD'),pauseBtn=$('pause'),clearBtn=$('clear');
+let paused=false,counts={f:0,R:0,C:0,maxdt:0},seen=new Set();
+pauseBtn.onclick=()=>{paused=!paused;pauseBtn.classList.toggle('active',paused);pauseBtn.textContent=paused?'Resume':'Pause';};
+clearBtn.onclick=()=>{logEl.innerHTML='';counts={f:0,R:0,C:0,maxdt:0};upd();};
+sessSel.onchange=applyFilter;
+function upd(){cF.textContent=counts.f;cR.textContent=counts.R;cC.textContent=counts.C;cD.textContent=counts.maxdt;}
+function applyFilter(){const s=sessSel.value;for(const r of logEl.children){const rs=r.dataset.session;r.style.display=(s==='all'||rs===undefined||rs===s)?'':'none';}}
+function sessColor(n){return 'hsl('+((parseInt(n)*47)%360)+',70%,62%)';}
+function group(h){return (h.match(/../g)||[]).join(' ');}
+function addSession(s){if(s===undefined||seen.has(s))return;seen.add(s);const o=document.createElement('option');o.value=s;o.textContent='session '+s;sessSel.appendChild(o);}
+
+/* --- APDU command / status decoder --- */
+function decode(hex,src){
+  if(!hex) return src==='CARD'?'odpoveď':'rámec';
+  const h=hex.toLowerCase();
+  if(src==='CARD'){
+    if(h.length>=4){const sw=h.slice(-4);
+      const m={'9000':'OK','6a82':'súbor nenájdený','6700':'zlá dĺžka','6982':'security','6985':'podmienky nesplnené','6a86':'zlé P1/P2','6d00':'INS nepodporované','6300':'zlyhanie','6a83':'záznam nenájdený'};
+      return 'odpoveď · SW '+sw.toUpperCase()+(m[sw]?' ('+m[sw]+')':'');}
+    return 'odpoveď';
+  }
+  if(h.startsWith('00a404000e325041592e5359532e4444463031'))return 'SELECT PPSE';
+  if(h.startsWith('00a40400'))return 'SELECT AID';
+  if(h.startsWith('80a80000'))return 'GET PROCESSING OPTIONS';
+  if(h.startsWith('00b2'))return 'READ RECORD';
+  if(h.startsWith('80ca'))return 'GET DATA';
+  if(h.startsWith('80ae'))return 'GENERATE AC';
+  if(h.startsWith('0020'))return 'VERIFY';
+  if(h.startsWith('00840000'))return 'GET CHALLENGE';
+  return 'command';
+}
+
+/* --- BER-TLV parser (EMV) --- */
+const TAGS={'4f':'AID','50':'App Label','57':'Track2 Equiv','5a':'PAN','5f20':'Cardholder Name','5f24':'Expiry','5f28':'Issuer Country','5f2a':'Tx Currency','5f34':'PAN Seq','82':'AIP','84':'DF Name','87':'App Priority','88':'SFI','8c':'CDOL1','8d':'CDOL2','8e':'CVM List','94':'AFL','9a':'Tx Date','9c':'Tx Type','9f02':'Amount','9f06':'AID (term)','9f07':'AUC','9f08':'App Version','9f0d':'IAC Default','9f0e':'IAC Denial','9f0f':'IAC Online','9f10':'Issuer App Data','9f11':'Issuer CTI','9f12':'App Pref Name','9f1a':'Country (term)','9f26':'App Cryptogram','9f27':'CID','9f36':'ATC','9f37':'Unpredictable','9f38':'PDOL','9f42':'App Currency','6f':'FCI','a5':'FCI Proprietary','61':'App Template','70':'Record Template','77':'Response (fmt2)','80':'Response (fmt1)','bf0c':'FCI Issuer Disc','90':'Issuer PK Cert','9f4a':'SDA Tag List'};
+const MASK=new Set(['5a','57']);
+function parseTLV(hex){
+  const b=[];for(let i=0;i<hex.length;i+=2)b.push(parseInt(hex.substr(i,2),16));
+  let i=0;const out=[];
+  try{
+    while(i<b.length){
+      if(b[i]===0x00||b[i]===0xff){i++;continue;}
+      let t=b[i++],s=t.toString(16).padStart(2,'0');const cons=(t&0x20)!==0;
+      if((t&0x1f)===0x1f){do{s+=b[i].toString(16).padStart(2,'0');}while(b[i++]&0x80&&i<b.length);}
+      let l=b[i++];if(l&0x80){let n=l&0x7f;l=0;while(n-->0)l=(l<<8)|b[i++];}
+      if(i+l>b.length)break;
+      const val=b.slice(i,i+l);i+=l;
+      const vhex=val.map(x=>x.toString(16).padStart(2,'0')).join('');
+      const node={tag:s,name:TAGS[s]||('tag '+s.toUpperCase())};
+      if(cons)node.children=parseTLV(vhex);else node.hex=vhex;
+      out.push(node);
+    }
+  }catch(e){}
+  return out;
+}
+function ascii(h){try{return h.replace(/../g,m=>{const c=parseInt(m,16);return c>=32&&c<127?String.fromCharCode(c):'.';});}catch(e){return h;}}
+function maskPAN(h){const p=h.replace(/f+$/i,'');return p.length>=10?p.slice(0,6)+'•'.repeat(p.length-10)+p.slice(-4):'••••';}
+function fmtVal(tag,hex){
+  if(MASK.has(tag)&&!reveal.checked){
+    if(tag==='5a')return '<span class="mask">'+maskPAN(hex)+'</span>';
+    const d=hex.toUpperCase(),k=d.search(/D/);const pan=k>0?d.slice(0,k):d,rest=k>0?d.slice(k):'';
+    return '<span class="mask">'+maskPAN(pan)+(rest?' '+rest:'')+'</span>';
+  }
+  if(['50','5f20','9f12'].includes(tag))return '<span class="v">'+ascii(hex)+'</span>';
+  return '<span class="v">'+group(hex)+'</span>';
+}
+function renderTLV(nodes,d){
+  d=d||0;let s='';
+  for(const n of nodes){
+    s+='<div style="padding-left:'+(d*14)+'px"><span class="tag">'+n.tag.toUpperCase()+'</span> <span class="nm">'+n.name+'</span>';
+    if(n.children)s+='</div>'+renderTLV(n.children,d+1);
+    else s+=' : '+fmtVal(n.tag,n.hex||'')+'</div>';
+  }
+  return s;
+}
+
+function render(ev){
+  if(ev.t!=='frame'){
+    const d=document.createElement('div');d.className='frame';
+    let msg=ev.msg||'';try{const j=JSON.parse(ev.msg);msg='['+(j.tag||'')+'] '+j.message;}catch(e){}
+    d.innerHTML='<div class="sys '+(ev.level||'')+'">'+(ev.ts||'')+'  '+msg+'</div>';
+    append(d);return;
+  }
+  const s=String(ev.session);addSession(s);
+  counts.f++;if(ev.src==='READER')counts.R++;else if(ev.src==='CARD')counts.C++;
+  if(typeof ev.dt==='number'&&ev.dt>counts.maxdt)counts.maxdt=Math.round(ev.dt);
+  upd();
+  const side=ev.src==='CARD'?'C':'R';
+  const t=parseFloat(thr.value)||0;
+  let dtCls='dt';if(typeof ev.dt==='number'){if(ev.dt>=t*3)dtCls+=' bad';else if(ev.dt>=t)dtCls+=' warn';}
+  const dtTxt=(typeof ev.dt==='number')?('Δ '+ev.dt+' ms'):'';
+  const arrow=side==='C'?'◀──':'──▶';
+  // TLV: card responses (strip SW), else none
+  let det='';
+  if(ev.hex){
+    let tlvHex=ev.hex;
+    if(side==='C'&&tlvHex.length>4)tlvHex=tlvHex.slice(0,-4);
+    const nodes=parseTLV(tlvHex);
+    if(nodes.length)det+='<div class="tlv">'+renderTLV(nodes)+'</div>';
+    det+='<div class="hx" style="margin-top:6px">'+group(ev.hex)+'</div>';
+  }
+  const cell='<div class="cell" onclick="this.classList.toggle(\'open\')">'
+    +'<div class="lbl">'+decode(ev.hex,ev.src)+'</div>'
+    +(ev.hex?'<div class="hx">'+group(ev.hex).slice(0,80)+(ev.hex.length>80?' …':'')+'</div>':'')
+    +'<div class="det">'+det+'</div></div>';
+  const metaCol='<div class="m"><span>'+ev.ts+'</span><span class="sess" style="background:'+sessColor(s)+'">S'+s+'</span></div>';
+  const arrowCol='<div class="arrow">'+arrow+'<span class="'+dtCls+'">'+dtTxt+'</span></div>';
+  const d=document.createElement('div');d.className='frame '+side;d.dataset.session=s;
+  d.innerHTML=metaCol+(side==='R'?cell:'<div></div>')+arrowCol+(side==='C'?cell:'<div></div>');
+  const cur=sessSel.value;if(cur!=='all'&&cur!==s)d.style.display='none';
+  append(d);
+}
+function append(d){logEl.appendChild(d);while(logEl.childNodes.length>2500)logEl.removeChild(logEl.firstChild);if(auto.checked&&!paused)window.scrollTo(0,document.body.scrollHeight);}
+function connect(){const es=new EventSource('/stream');es.onopen=()=>dot.classList.add('on');es.onerror=()=>dot.classList.remove('on');es.onmessage=e=>{if(paused)return;try{render(JSON.parse(e.data));}catch(err){}};}
+connect();
+</script>
+</body></html>

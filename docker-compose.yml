@@ -1,0 +1,13 @@
+services:
+  relay:
+    build: .
+    image: nfcgate-relay:latest
+    container_name: nfcgate-relay
+    ports:
+      - "5566:5566"   # relay (telefóny sa pripájajú sem)
+      - "8000:8000"   # Prometheus metriky
+      - "8081:8080"   # health check -> host 8081 (8080 zaberá FROG Workbench)
+      - "8090:8090"   # web log service (živý APDU stream)
+    # pre logovanie APDU pusti s pluginom:  command: ["log"]
+    command: []
+    restart: unless-stopped

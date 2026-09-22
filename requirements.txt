@@ -1,0 +1,6 @@
+# NFCGate async relay server — runtime dependencies
+# Tested with Python 3.14 on macOS (Apple Silicon).
+protobuf>=5.29        # protobuf 4.x C-extension crashes on Python 3.14 ("Metaclasses with custom tp_new"); 5.29+/6.x/7.x work
+uvloop>=0.22          # first release with cp314 wheels (POSIX only; not available on Windows)
+prometheus_client>=0.20
+colorama>=0.4         # used by plugins/mod_log.py for coloured output

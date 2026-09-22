@@ -4,19 +4,130 @@ import ssl
 import struct
 import datetime
 import logging
-import sys, json
+import sys, json, collections, time, ipaddress
 import uvloop
 import signal
 from prometheus_client import start_http_server, Gauge
 
-HOST = "0.0.0.0"
-PORT = 5566
+import os
+
+# Optional protobuf decoding of relayed frames (for the web log view).
+# The relay itself never depends on this — decoding is best-effort.
+try:
+    from plugins import c2c_pb2, c2s_pb2
+    _PROTO_OK = True
+except Exception:  # pragma: no cover - decoding is optional
+    _PROTO_OK = False
+
+
+def _env_int(name, default):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        logging.warning(f"Invalid int in env {name}={val!r}, using default {default}")
+        return default
+
+
+# Defaults (overridable via env or CLI). Set a *_PORT to 0 to disable that listener.
+DEFAULT_HOST = os.environ.get("NFCGATE_HOST", "0.0.0.0")
+DEFAULT_PORT = _env_int("NFCGATE_PORT", 5566)
+DEFAULT_HEALTH_PORT = _env_int("NFCGATE_HEALTH_PORT", 8080)
+DEFAULT_METRICS_PORT = _env_int("NFCGATE_METRICS_PORT", 8000)
+DEFAULT_LOG_PORT = _env_int("NFCGATE_LOG_PORT", 8090)
 
 # Set uvloop as the event loop policy for better performance
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # Metrics
 connection_count = Gauge('active_connections', 'Number of active connections')
+
+
+def _now():
+    return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+class LogHub:
+    """In-memory ring buffer + pub/sub feeding the HTTP log service.
+
+    Events are plain dicts. Two kinds:
+      {"t": "frame", ...}  one relayed APDU (decoded when possible)
+      {"t": "log", ...}    a system log line
+    """
+    def __init__(self, maxlen=1000):
+        self.buffer = collections.deque(maxlen=maxlen)
+        self.subscribers = set()
+
+    def publish(self, event):
+        self.buffer.append(event)
+        for q in list(self.subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    def subscribe(self):
+        q = asyncio.Queue(maxsize=2000)
+        self.subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q):
+        self.subscribers.discard(q)
+
+
+log_hub = LogHub()
+
+
+class _HubHandler(logging.Handler):
+    """Feeds every log record into the LogHub as a {"t":"log"} event."""
+    def emit(self, record):
+        try:
+            log_hub.publish({
+                "t": "log",
+                "ts": _now(),
+                "level": record.levelname,
+                "msg": record.getMessage(),
+            })
+        except Exception:
+            pass
+
+
+def decode_frame(payload):
+    """Best-effort decode of a relayed ServerData/NFCData frame.
+    Returns a dict with any of {op, src, hex}; empty dict on failure."""
+    out = {}
+    if not _PROTO_OK or not payload:
+        return out
+    try:
+        sd = c2s_pb2.ServerData()
+        sd.ParseFromString(payload)
+        try:
+            out["op"] = c2s_pb2.ServerData.Opcode.Name(sd.opcode)
+        except Exception:
+            out["op"] = str(sd.opcode)
+        if sd.data:
+            nd = c2c_pb2.NFCData()
+            nd.ParseFromString(sd.data)
+            out["src"] = "CARD" if nd.data_source == c2c_pb2.NFCData.CARD else "READER"
+            out["hex"] = bytes(nd.data).hex()
+    except Exception:
+        pass
+    return out
+
+
+# The web log page (served at GET / on the log port) lives in weblog.html
+_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "weblog.html")
+def _load_page():
+    try:
+        with open(_PAGE_PATH, encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logging.warning(f"weblog.html not found ({e}); serving minimal page")
+        return "<!doctype html><meta charset=utf-8><title>NFCGate log</title><body style='background:#141414;color:#eee;font-family:sans-serif'>weblog.html missing on server</body>"
+LOG_PAGE = _load_page()
+
 
 # Configure structured logging
 def setup_logging(level="INFO"):
@@ -26,6 +137,9 @@ def setup_logging(level="INFO"):
     formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+    hub_handler = _HubHandler()
+    logger.addHandler(hub_handler)
+
 
 def log(message, origin="server", tag="server", level="INFO"):
     log_message = {
@@ -36,6 +150,7 @@ def log(message, origin="server", tag="server", level="INFO"):
     }
     log_function = getattr(logging, level.lower(), logging.info)
     log_function(json.dumps(log_message))
+
 
 class PluginHandler:
     def __init__(self, plugins):
@@ -56,6 +171,7 @@ class PluginHandler:
                 client.log(f"Error in plugin {modname}: {e}", tag="plugin", level="ERROR")
         return data
 
+
 class Client:
     def __init__(self, reader, writer, address, server, timeout=300):
         self.reader = reader
@@ -64,6 +180,10 @@ class Client:
         self.state = {}
         self.server = server
         self.timeout = timeout
+        # Serialize writes to this client so concurrent relays (in sessions with
+        # more than 2 peers) cannot interleave frames. Async port of upstream
+        # nfcgate/server commit eaaf5e7 (threading.Lock -> asyncio.Lock).
+        self.write_lock = asyncio.Lock()
 
     def log(self, *args, tag="server", level="INFO"):
         log(" ".join(map(str, args)), origin=self.address, tag=tag, level=level)
@@ -74,7 +194,8 @@ class Client:
                 msg_len_data = await asyncio.wait_for(self.reader.readexactly(5), timeout=self.timeout)
                 msg_len, session_id = struct.unpack("!IB", msg_len_data)
                 data = await asyncio.wait_for(self.reader.readexactly(msg_len), timeout=self.timeout)
-                self.log("data:", data)
+                # raw bytes only at DEBUG (structured frame goes to the web log instead)
+                self.log("data:", data, level="DEBUG")
                 await self.server.process_data(self, session_id, data)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             self.log("disconnected due to inactivity or read error")
@@ -84,64 +205,104 @@ class Client:
             self.writer.close()
             await self.writer.wait_closed()
 
+
 class NFCGateServer:
-    def __init__(self, host, port, plugins, tls_options=None, max_clients=100):
+    def __init__(self, host, port, plugins, tls_options=None, max_clients=100, health_port=DEFAULT_HEALTH_PORT, log_port=DEFAULT_LOG_PORT, max_peers=2, allow_nets=None):
         self.host = host
         self.port = port
+        self.health_port = health_port
+        self.log_port = log_port
+        self.max_peers = max_peers            # max clients per session (0 = unlimited)
+        self.allow_nets = allow_nets or []    # list of ip_network; empty = allow all
         self.plugins = PluginHandler(plugins)
         self.clients = {}
+        self._last_frame_ts = {}              # session -> monotonic ts of last frame
         self.tls_options = tls_options
         self.running = True
         self.semaphore = asyncio.Semaphore(max_clients)
         connection_count.set(0)
 
+    def _allowed(self, addr):
+        if not self.allow_nets:
+            return True
+        try:
+            ip = ipaddress.ip_address(addr[0])
+        except Exception:
+            return False
+        return any(ip in net for net in self.allow_nets)
+
     async def handle_client(self, reader, writer):
         async with self.semaphore:
             client_address = writer.get_extra_info('peername')
+            if not self._allowed(client_address):
+                log(f"rejected {client_address}: not in allowlist", tag="acl", level="WARNING")
+                writer.close()
+                await writer.wait_closed()
+                return
             client = Client(reader, writer, client_address, self)
+            # gauge tracks live TCP connections (one inc per socket, one dec on close)
+            connection_count.inc()
             client.log("connected")
             try:
                 await client.receive_data()
             finally:
                 self.remove_client(client)
+                connection_count.dec()
+
+    def _publish_frame(self, session_id, payload):
+        now = time.monotonic()
+        prev = self._last_frame_ts.get(session_id)
+        self._last_frame_ts[session_id] = now
+        ev = {"t": "frame", "ts": _now(), "session": session_id, "n": len(payload)}
+        if prev is not None:
+            ev["dt"] = round((now - prev) * 1000, 1)   # ms since previous frame in this session
+        ev.update(decode_frame(payload))
+        log_hub.publish(ev)
 
     async def process_data(self, client, session_id, data):
         # Filter data through plugins
         filtered_data = await self.plugins.filter(client, data)
 
-        # Session management
-        if client not in self.clients.get(session_id, set()):
+        # Session management + peer limit (default 2: reader + card only)
+        members = self.clients.get(session_id)
+        if client not in (members or ()):
+            if self.max_peers and members and len(members) >= self.max_peers:
+                client.log(f"session {session_id} full ({self.max_peers} peers), rejecting join", tag="session", level="WARNING")
+                return  # do not add, do not relay this outsider's frames
             self.add_client(client, session_id)
+
+        # Structured event for the web log view (decoded best-effort)
+        self._publish_frame(session_id, filtered_data)
 
         # Broadcast data to other clients in the same session
         await self.send_to_clients(session_id, filtered_data, client)
 
     def add_client(self, client, session):
-        connection_count.inc()
         if session not in self.clients:
             self.clients[session] = set()
         self.clients[session].add(client)
         client.log(f"joined session {session}")
 
     def remove_client(self, client):
-        connection_count.dec()
         for session, clients in self.clients.items():
             if client in clients:
                 clients.discard(client)
                 client.log(f"left session {session}")
                 if not clients:
                     del self.clients[session]
+                    self._last_frame_ts.pop(session, None)
                 break
 
     async def send_to_clients(self, session, data, origin):
         if session not in self.clients:
             return
-        for client in self.clients[session]:
+        for client in list(self.clients[session]):
             if client is origin:
                 continue
             try:
-                client.writer.write(struct.pack("!I", len(data)) + data)
-                await client.writer.drain()
+                async with client.write_lock:
+                    client.writer.write(struct.pack("!I", len(data)) + data)
+                    await client.writer.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 self.remove_client(client)
         log(f"Publish reached {len(self.clients.get(session, []))} clients", tag="broadcast")
@@ -168,9 +329,78 @@ class NFCGateServer:
             writer.close()
             await writer.wait_closed()
 
-        health_server = await asyncio.start_server(handle_health_check, host="0.0.0.0", port=8080)
+        try:
+            health_server = await asyncio.start_server(handle_health_check, host=self.host, port=self.health_port)
+        except OSError as e:
+            log(f"Health check disabled: cannot bind port {self.health_port}: {e}", tag="health", level="WARNING")
+            return
+        addr = health_server.sockets[0].getsockname()
+        log(f"Health check listening on {addr}", tag="health")
         async with health_server:
             await health_server.serve_forever()
+
+    async def log_http_server(self):
+        async def handle(reader, writer):
+            try:
+                request_line = await reader.readline()
+                while True:
+                    hdr = await reader.readline()
+                    if hdr in (b"\r\n", b"\n", b""):
+                        break
+                parts = request_line.split()
+                path = parts[1].decode("latin-1") if len(parts) >= 2 else "/"
+                if path.startswith("/stream"):
+                    await self._log_stream(writer)
+                    return
+                if path.startswith("/logs"):
+                    body = json.dumps(list(log_hub.buffer)).encode("utf-8")
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n" + body)
+                else:
+                    body = LOG_PAGE.encode("utf-8")
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n" + body)
+                await writer.drain()
+            except Exception as e:
+                log(f"log http error: {e}", tag="logsvc", level="ERROR")
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        try:
+            srv = await asyncio.start_server(handle, host=self.host, port=self.log_port)
+        except OSError as e:
+            log(f"Log service disabled: cannot bind port {self.log_port}: {e}", tag="logsvc", level="WARNING")
+            return
+        addr = srv.sockets[0].getsockname()
+        log(f"Log service (web) on http://{addr[0]}:{addr[1]}/", tag="logsvc")
+        async with srv:
+            await srv.serve_forever()
+
+    async def _log_stream(self, writer):
+        q = log_hub.subscribe()
+
+        def sse(ev):
+            return b"data: " + json.dumps(ev).encode("utf-8", "replace") + b"\n\n"
+
+        try:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
+            for ev in list(log_hub.buffer):
+                writer.write(sse(ev))
+            await writer.drain()
+            while True:
+                ev = await q.get()
+                writer.write(sse(ev))
+                await writer.drain()
+        except Exception:
+            # a log viewer disconnecting is normal — never surface it as an error
+            pass
+        finally:
+            log_hub.unsubscribe(q)
+            try:
+                writer.close()
+            except Exception:
+                pass
 
     async def start(self):
         ssl_context = None
@@ -181,8 +411,13 @@ class NFCGateServer:
         addr = server.sockets[0].getsockname()
         log(f"Server running on {addr}")
 
-        # Start health check server as a background task
-        asyncio.create_task(self.health_check_server())
+        # Start health check server as a background task (health_port=0 disables it)
+        if self.health_port:
+            asyncio.create_task(self.health_check_server())
+
+        # Start web log service (log_port=0 disables it)
+        if self.log_port:
+            asyncio.create_task(self.log_http_server())
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -195,17 +430,31 @@ class NFCGateServer:
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         context.load_cert_chain(certfile=self.tls_options['cert_file'], keyfile=self.tls_options['key_file'])
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.set_ciphers('ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384')
-        context.verify_mode = ssl.CERT_REQUIRED
-        context.load_verify_locations(cafile="path/to/ca-certificates.pem")
+        # Client-certificate auth only when a CA is supplied; otherwise server-side TLS only.
+        ca_file = self.tls_options.get('ca_file')
+        if ca_file:
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile=ca_file)
+        else:
+            context.verify_mode = ssl.CERT_NONE
         return context
+
 
 def parse_args():
     parser = argparse.ArgumentParser(prog="NFCGate server")
     parser.add_argument("plugins", type=str, nargs="*", help="List of plugin modules to load.")
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address (default {DEFAULT_HOST}, env NFCGATE_HOST).")
+    parser.add_argument("-p", "--port", type=int, default=DEFAULT_PORT, help=f"Relay TCP port (default {DEFAULT_PORT}, env NFCGATE_PORT).")
+    parser.add_argument("--health-port", type=int, default=DEFAULT_HEALTH_PORT, help=f"Health-check HTTP port, 0 disables (default {DEFAULT_HEALTH_PORT}, env NFCGATE_HEALTH_PORT).")
+    parser.add_argument("--metrics-port", type=int, default=DEFAULT_METRICS_PORT, help=f"Prometheus metrics port, 0 disables (default {DEFAULT_METRICS_PORT}, env NFCGATE_METRICS_PORT).")
+    parser.add_argument("--log-port", type=int, default=DEFAULT_LOG_PORT, help=f"Web log service port (live APDU stream), 0 disables (default {DEFAULT_LOG_PORT}, env NFCGATE_LOG_PORT).")
+    parser.add_argument("--max-peers", type=int, default=_env_int("NFCGATE_MAX_PEERS", 2), help="Max clients per session, 0 = unlimited (default 2 = reader+card, env NFCGATE_MAX_PEERS).")
+    parser.add_argument("--allow", default=os.environ.get("NFCGATE_ALLOW", ""), help="Comma-separated IP/CIDR allowlist for incoming connections (default: allow all, env NFCGATE_ALLOW).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging, includes raw relayed frames on the console.")
     parser.add_argument("-s", "--tls", help="Enable TLS. You must specify certificate and key.", default=False, action="store_true")
     parser.add_argument("--tls_cert", help="TLS certificate file in PEM format.", action="store")
     parser.add_argument("--tls_key", help="TLS key file in PEM format.", action="store")
+    parser.add_argument("--tls_ca", help="CA file (PEM) to require & verify client certificates (mutual TLS). Omit for server-side TLS only.", action="store")
 
     args = parser.parse_args()
     tls_options = None
@@ -217,23 +466,45 @@ def parse_args():
 
         tls_options = {
             "cert_file": args.tls_cert,
-            "key_file": args.tls_key
+            "key_file": args.tls_key,
+            "ca_file": args.tls_ca,
         }
 
-    return args.plugins, tls_options
+    return args, tls_options
+
 
 def main():
-    plugins, tls_options = parse_args()
-    setup_logging("DEBUG")
-    server = NFCGateServer(HOST, PORT, plugins, tls_options)
+    args, tls_options = parse_args()
+    setup_logging("DEBUG" if args.verbose else "INFO")
+    allow_nets = []
+    for item in (args.allow or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            allow_nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logging.warning(f"Ignoring invalid --allow entry: {item!r}")
+    server = NFCGateServer(args.host, args.port, args.plugins, tls_options,
+                           health_port=args.health_port, log_port=args.log_port,
+                           max_peers=args.max_peers, allow_nets=allow_nets)
+    if allow_nets:
+        logging.info(f"Connection allowlist: {[str(n) for n in allow_nets]}")
+    logging.info(f"Max peers per session: {args.max_peers or 'unlimited'}")
 
-    # Start the Prometheus metrics server
-    start_http_server(8000)
+    # Start the Prometheus metrics server (metrics_port=0 disables it)
+    if args.metrics_port:
+        try:
+            start_http_server(args.metrics_port)
+            logging.info(f"Prometheus metrics on :{args.metrics_port}")
+        except OSError as e:
+            logging.warning(f"Metrics disabled: cannot bind port {args.metrics_port}: {e}")
 
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
         logging.info("Server shutting down")
+
 
 if __name__ == "__main__":
     main()
