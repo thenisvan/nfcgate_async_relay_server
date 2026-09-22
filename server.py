@@ -113,6 +113,7 @@ def decode_frame(payload):
             nd.ParseFromString(sd.data)
             out["src"] = "CARD" if nd.data_source == c2c_pb2.NFCData.CARD else "READER"
             out["hex"] = bytes(nd.data).hex()
+            out["dtp"] = "INITIAL" if nd.data_type == c2c_pb2.NFCData.INITIAL else "CONT"
     except Exception:
         pass
     return out

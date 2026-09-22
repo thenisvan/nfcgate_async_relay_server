@@ -67,6 +67,8 @@ input[type=number]{width:60px}
 .hxfull{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#8ea0ad;word-break:break-all;margin-top:4px}
 .sys{color:var(--muted);font-size:12px;padding:2px 20px;font-family:ui-monospace,Menlo,Consolas,monospace}
 .sys.ERROR{color:var(--red)} .sys.WARNING{color:var(--yellow)}
+.tagrow{padding:6px 2px;border-bottom:1px solid var(--line);color:var(--blue);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+.tagrow b{color:#e9ecef}
 /* reference drawer */
 #ref{position:fixed;top:0;right:0;width:360px;max-width:92vw;height:100vh;background:var(--panel2);border-left:1px solid #2b2f33;overflow:auto;padding:16px 18px;transform:translateX(100%);transition:transform .2s;z-index:10}
 #ref.on{transform:none}
@@ -95,6 +97,7 @@ input[type=number]{width:60px}
 </header>
 <div class="ctxbar" id="ctx">
   <span><span class="k">Technológia:</span> <span class="v" id="cxTech">—</span></span>
+  <span><span class="k">Karta:</span> <span class="v" id="cxCard">—</span></span>
   <span><span class="k">Schéma:</span> <span class="v" id="cxScheme">—</span></span>
   <span><span class="k">Flow:</span> <span class="v" id="cxFlow">—</span></span>
   <span><span class="k">Fáza:</span> <span class="v" id="cxPhase">—</span></span>
@@ -184,6 +187,45 @@ function describe(hex,src){
   return{fields:b};
 }
 
+/* ---------------- NCI initial config (tag technology) ---------------- */
+function parseNci(hex){
+  const b=[];for(let i=0;i<hex.length;i+=2)b.push(parseInt(hex.substr(i,2),16));
+  const opt={};let i=0;
+  while(i+2<=b.length){const type=b[i],len=b[i+1];if(i+2+len>b.length)break;
+    opt[type]=b.slice(i+2,i+2+len).map(x=>x.toString(16).padStart(2,'0')).join('');i+=2+len;}
+  const atqa=(opt[0x30]!==undefined&&opt[0x31]!==undefined)?(opt[0x30]+opt[0x31]):null;
+  const o={atqa:atqa,sak:opt[0x32]||null,uid:opt[0x33]||null,hist:opt[0x59]||null,
+    typeB:(opt[0x38]!==undefined||opt[0x39]!==undefined),typeF:(opt[0x40]!==undefined)};
+  o.ok=!!(o.sak||o.atqa||o.hist||o.typeB||o.typeF);
+  return o;
+}
+function tagType(n){
+  if(n.typeF)return 'FeliCa (Type F)';
+  if(n.typeB)return 'ISO 14443-4 Type B';
+  const sak=n.sak!=null?parseInt(n.sak,16):null;const atqa=(n.atqa||'').toLowerCase();
+  if(sak===0x00)return 'MIFARE Ultralight / NTAG';
+  if(sak===0x08)return 'MIFARE Classic 1K';
+  if(sak===0x09)return 'MIFARE Mini';
+  if(sak===0x18)return 'MIFARE Classic 4K';
+  if(sak===0x10||sak===0x11)return 'MIFARE Plus (SL2)';
+  if(sak===0x20)return (atqa==='0344'||atqa==='4403')?'MIFARE DESFire':'ISO-DEP (ISO 14443-4)';
+  if(sak===0x28)return 'JCOP (Classic + ISO-DEP)';
+  if(sak===0x38)return 'MIFARE Plus / SmartMX';
+  if(n.atqa||n.uid)return 'ISO 14443-3 Type A';
+  return 'neznáma';
+}
+function renderTag(s,ev,nci){
+  const old=flows[s];if(old&&old.el&&((old.tech==='ISO'&&old.count<=2)||(old.card&&old.count<=1)))old.el.remove();
+  const f=flows[s]=newFlow(s,null);
+  f.card=tagType(nci);f.phase='karta detegovaná';
+  f.count++;if(typeof ev.ms==='number'){f.start=ev.ms;f.last=ev.ms;}
+  updateFlowHead(f);setCtx(f);
+  const row=document.createElement('div');row.className='tagrow';row.dataset.session=s;row.dataset.tech='';
+  row.innerHTML='🎫 Karta: <b>'+f.card+'</b> · UID '+(nci.uid?group(nci.uid):'—')+' · ATQA '+(nci.atqa?nci.atqa.toUpperCase():'—')+' · SAK '+(nci.sak?nci.sak.toUpperCase():'—')+(nci.hist?' · hist '+group(nci.hist):'');
+  f.body.appendChild(row);applyFilterTo(f.el);trim();
+  if(auto.checked&&!paused)window.scrollTo(0,document.body.scrollHeight);
+}
+
 /* ---------------- flow grouping ---------------- */
 const flows={};   // session -> flow state
 function flowName(tech){return {EMV:'EMV platba',DESFire:'DESFire relácia',NTAG:'Čítanie tagu',FeliCa:'FeliCa',ISO:'ISO-DEP relácia'}[tech]||'Relácia';}
@@ -201,11 +243,12 @@ function updateFlowHead(f){
   const t=f.head.querySelector('[data-t]');t.textContent=f.tech||'?';t.className='tech '+techClass(f.tech);
   f.head.querySelector('[data-nm]').textContent=flowName(f.tech);
   const dur=(f.start!=null&&f.last!=null)?((f.last-f.start)/1000).toFixed(1)+'s':'';
-  f.head.querySelector('[data-sub]').textContent=' · S'+f.sess+(f.scheme?' · '+f.scheme:'')+' · '+f.count+' APDU'+(dur?' · '+dur:'');
+  f.head.querySelector('[data-sub]').textContent=' · S'+f.sess+(f.card?' · '+f.card:'')+(f.scheme?' · '+f.scheme:'')+' · '+f.count+' APDU'+(dur?' · '+dur:'');
   const r=f.head.querySelector('[data-res]');if(f.result){r.textContent=f.result;r.className='res '+f.resClass;}
 }
 function shouldStartFlow(sess,c){
   const f=flows[sess];if(!f)return true;
+  if(f.card&&f.count<=1)return false;          // continue a flow just opened by a card-detect
   if(c.name==='SELECT PPSE')return true;
   if(c.tech==='DESFire'&&/GetVersion/.test(c.name))return true;
   return false;
@@ -216,6 +259,7 @@ function addSess(s){if(seenS.has(s))return;seenS.add(s);const o=document.createE
 /* ---------------- context strip ---------------- */
 function setCtx(f){
   $('cxTech').textContent=f.tech||'—';$('cxTech').className='v';
+  $('cxCard').textContent=f.card||'—';
   $('cxScheme').textContent=f.scheme||'—';
   $('cxFlow').textContent=flowName(f.tech);
   $('cxPhase').textContent=f.phase||'—';
@@ -234,6 +278,7 @@ function render(ev){
   const s=String(ev.session);addSess(s);
   counts.f++;if(ev.src==='READER')counts.R++;else if(ev.src==='CARD')counts.C++;
   cF.textContent=counts.f;cR.textContent=counts.R;cC.textContent=counts.C;
+  if(ev.dtp==='INITIAL'&&ev.hex){const nci=parseNci(ev.hex);if(nci.ok){renderTag(s,ev,nci);return;}}
 
   const c=classify(ev.hex,ev.src);
   // flow selection
