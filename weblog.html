@@ -144,6 +144,7 @@ const heroEl=$('hero'),rttEl=$('rtt'),rttMaxEl=$('rttmax'),rttAddEl=$('rttadd');
 let paused=false,counts={f:0,R:0,C:0},seenS=new Set(),seenT=new Set();
 let lastReader={},rttMax=0;
 let rttWin=[],frameTimes=[],bytesTotal=0;
+const noScroll=location.search.indexOf('noscroll')>=0;
 
 /* ---------------- dictionaries ---------------- */
 const INS={'a4':'SELECT','b0':'READ BINARY','b2':'READ RECORD','d0':'WRITE BINARY','d6':'UPDATE BINARY',
@@ -253,7 +254,7 @@ function renderTag(s,ev,nci){
   const row=document.createElement('div');row.className='tagrow';row.dataset.session=s;row.dataset.tech='';
   row.innerHTML='🎫 Karta: <b>'+f.card+'</b> · UID '+(nci.uid?group(nci.uid):'—')+' · ATQA '+(nci.atqa?nci.atqa.toUpperCase():'—')+' · SAK '+(nci.sak?nci.sak.toUpperCase():'—')+(nci.hist?' · hist '+group(nci.hist):'');
   f.body.appendChild(row);applyFilterTo(f.el);trim();
-  if(auto.checked&&!paused)window.scrollTo(0,document.body.scrollHeight);
+  if(auto.checked&&!paused&&!noScroll)window.scrollTo(0,document.body.scrollHeight);
 }
 
 /* ---------------- flow grouping ---------------- */
@@ -355,7 +356,7 @@ function render(ev){
   f.body.appendChild(row);
   applyFilterTo(f.el);
   trim();
-  if(auto.checked&&!paused)window.scrollTo(0,document.body.scrollHeight);
+  if(auto.checked&&!paused&&!noScroll)window.scrollTo(0,document.body.scrollHeight);
 }
 function sessColor(n){return 'hsl('+((parseInt(n)*47)%360)+',70%,62%)';}
 function updateStats(){
@@ -424,7 +425,7 @@ async function loadPortal(){
 }
 api('/api/plugins').then(j=>tamperBanner(j.plugins)).catch(()=>{});
 
-function connect(){const es=new EventSource('/stream');es.onopen=()=>dot.classList.add('on');es.onerror=()=>dot.classList.remove('on');es.onmessage=e=>{if(paused)return;try{render(JSON.parse(e.data));}catch(err){}};}
+function connect(){if(location.search.indexOf('static')>=0){fetch('/logs').then(r=>r.json()).then(evs=>{dot.classList.add('on');evs.forEach(e=>{try{render(e);}catch(x){}});}).catch(()=>{});return;}const es=new EventSource('/stream');es.onopen=()=>dot.classList.add('on');es.onerror=()=>dot.classList.remove('on');es.onmessage=e=>{if(paused)return;try{render(JSON.parse(e.data));}catch(err){}};}
 connect();
 </script>
 </body></html>
