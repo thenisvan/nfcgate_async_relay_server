@@ -4,7 +4,7 @@ import ssl
 import struct
 import datetime
 import logging
-import sys, json, collections, time, ipaddress
+import sys, json, collections, time, ipaddress, socket
 import uvloop
 import signal
 from prometheus_client import start_http_server, Gauge
@@ -248,6 +248,14 @@ class NFCGateServer:
                 writer.close()
                 await writer.wait_closed()
                 return
+            # Disable Nagle: relayed APDU frames are tiny, so Nagle + delayed-ACK
+            # can add up to ~40 ms per round-trip. TCP_NODELAY sends them immediately.
+            _sock = writer.get_extra_info("socket")
+            if _sock is not None:
+                try:
+                    _sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
             client = Client(reader, writer, client_address, self)
             # gauge tracks live TCP connections (one inc per socket, one dec on close)
             connection_count.inc()
