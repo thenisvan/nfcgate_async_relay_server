@@ -5,9 +5,17 @@ import struct
 import datetime
 import logging
 import sys, json, collections, time, ipaddress, socket
-import uvloop
 import signal
-from prometheus_client import start_http_server, Gauge
+try:
+    from prometheus_client import start_http_server, Gauge
+except Exception:  # prometheus_client optional (e.g. Termux)
+    class Gauge:  # minimal no-op fallback
+        def __init__(self, *a, **k): pass
+        def set(self, *a, **k): pass
+        def inc(self, *a, **k): pass
+        def dec(self, *a, **k): pass
+    def start_http_server(*a, **k):
+        raise OSError("prometheus_client not installed")
 
 import os
 
@@ -39,8 +47,13 @@ DEFAULT_METRICS_PORT = _env_int("NFCGATE_METRICS_PORT", 8000)
 DEFAULT_LOG_PORT = _env_int("NFCGATE_LOG_PORT", 8090)
 DEFAULT_DELAY_MS = _env_int("NFCGATE_DELAY_MS", 0)
 
-# Set uvloop as the event loop policy for better performance
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# uvloop for performance where available (POSIX); fall back to default asyncio
+# loop on Termux/Windows or if uvloop is missing.
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    logging.info("uvloop not available; using default asyncio event loop")
 
 # Metrics
 connection_count = Gauge('active_connections', 'Number of active connections')
