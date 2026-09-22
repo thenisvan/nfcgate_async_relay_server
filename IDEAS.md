@@ -44,3 +44,7 @@ Brainstorm pre demo prednášky Ghost Tap. Zoradené, s odporúčaným výberom 
 3. **Session PSK + limit 2 peerov** (ops #1 + #2) — aby demo na otvorenej sieti nikto nenarušil.
 
 K tomu ako rýchle výhry: pytest suita + CI (ops #5) a Prometheus/Grafana profil (ops #3).
+
+**Doimplementované navyše (2026-09-22):** pytest suita + GitHub Actions CI (ops #5),
+a plugin `mod_modify` na živú modifikáciu relayovaného APDU (port konceptu
+penegui/`mod_pixpatch` do nášho protokolu, bezpečne vypnutý bez pravidiel).

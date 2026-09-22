@@ -91,7 +91,7 @@ def _wait_listening(port, timeout=15.0):
     return False
 
 
-def start_server(port, extra_args=None, metrics_port=0, health_port=0, log_port=0):
+def start_server(port, extra_args=None, metrics_port=0, health_port=0, log_port=0, env=None):
     """Launch server.py as a subprocess; returns the Popen handle."""
     args = [
         sys.executable, "server.py",
@@ -100,7 +100,10 @@ def start_server(port, extra_args=None, metrics_port=0, health_port=0, log_port=
         "--metrics-port", str(metrics_port),
         "--log-port", str(log_port),
     ] + (extra_args or [])
-    proc = subprocess.Popen(args, cwd=REPO)
+    proc_env = dict(os.environ)
+    if env:
+        proc_env.update(env)
+    proc = subprocess.Popen(args, cwd=REPO, env=proc_env)
     if not _wait_listening(port):
         proc.terminate()
         raise RuntimeError("server did not start listening in time")

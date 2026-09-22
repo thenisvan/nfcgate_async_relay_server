@@ -8,6 +8,8 @@ services:
       - "8000:8000"   # Prometheus metriky
       - "8081:8080"   # health check -> host 8081 (8080 zaberá FROG Workbench)
       - "8090:8090"   # web log service (živý APDU stream)
-    # pre logovanie APDU pusti s pluginom:  command: ["log"]
+    # plugin na logovanie APDU:            command: ["log"]
+    # plugin na modifikáciu APDU (lab MITM): command: ["modify"]
+    #   a k nemu pravidlo:  environment: [ "NFCGATE_PATCH_RULES=a0000000041010=a0000000031010" ]
     command: []
     restart: unless-stopped
